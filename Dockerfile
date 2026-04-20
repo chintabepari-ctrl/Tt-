@@ -28,9 +28,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata openssh-server sudo curl wget git nano procps net-tools iputils-ping dnsutils \
     lsof htop jq speedtest-cli unzip tree python3 python3-pip python3-venv \
     ca-certificates gnupg \
+    && pip3 install awscli \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone \
     && curl -fsSL https://tailscale.com/install.sh | sh \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/* /root/.cache/pip
+
+# --------------------------------------------------
+# Extra server tools + cloudflared
+# --------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tmux screen vim zip rsync socat telnet ncdu \
+    && mkdir -p /usr/share/keyrings \
+    && curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflare-main.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared jammy main" > /etc/apt/sources.list.d/cloudflared.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends cloudflared \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/*
 
@@ -77,6 +91,8 @@ RUN echo "export PS1='\[\e[1;32m\]\u@phoenix\[\e[0m\]:\[\e[1;36m\]\w\[\e[0m\]\$ 
 # Main shell setup
 # --------------------------------------------------
 RUN cat > /tmp/setup.sh <<'EOF'
+
+export PHOENIX_CPU_HISTORY_FILE="/tmp/.phoenix_cpu_history_${USER}"
 
 # ==========================================
 # 🚀 SYSTEM ALIASES (BUILT-IN)
@@ -300,6 +316,12 @@ function cmds() {
     pcmd "syshealth" "Full system health report"
     pcmd "uptime2" "Pretty uptime display"
     pcmd "envlist" "Show all env variables"
+    pcmd "bk save <srv> <nm>" "Backup practical full system to R2"
+    pcmd "bk list <srv>" "List server backups"
+    pcmd "bk inspect <srv> <nm>" "Extract latest backup to /tmp"
+    pcmd "bk restore <srv> <nm>" "Restore latest practical full system backup"
+    pcmd "bk restore-at <srv> <nm> <ts>" "Restore exact timestamp backup"
+    pcmd "bk clean-restore <srv> <nm>" "Clear writable areas then restore"
 
     echo -e "\n\e[1;35m👤 My Personal Shortcuts\e[0m"
     if [ -f "$CUSTOM_ALIAS_FILE" ] && [ -s "$CUSTOM_ALIAS_FILE" ]; then
@@ -353,6 +375,387 @@ function ex() {
     else
         echo -e "\e[1;31m✘ '$1' is not a valid file\e[0m"
     fi
+}
+
+# ==========================================
+# BACKUP / RESTORE (PRACTICAL FULL SYSTEM)
+# ==========================================
+
+function _bk_require_env() {
+    if [ -z "$BK_S3_ENDPOINT" ] || [ -z "$BK_S3_BUCKET" ] || [ -z "$BK_AWS_ACCESS_KEY_ID" ] || [ -z "$BK_AWS_SECRET_ACCESS_KEY" ]; then
+        echo -e "\e[1;31m✘ Backup env vars missing.\e[0m"
+        echo -e "Required:"
+        echo -e "  BK_S3_ENDPOINT"
+        echo -e "  BK_S3_BUCKET"
+        echo -e "  BK_AWS_ACCESS_KEY_ID"
+        echo -e "  BK_AWS_SECRET_ACCESS_KEY"
+        echo -e "Optional:"
+        echo -e "  BK_AWS_REGION=auto"
+        return 1
+    fi
+
+    export AWS_ACCESS_KEY_ID="$BK_AWS_ACCESS_KEY_ID"
+    export AWS_SECRET_ACCESS_KEY="$BK_AWS_SECRET_ACCESS_KEY"
+    export AWS_DEFAULT_REGION="${BK_AWS_REGION:-auto}"
+    return 0
+}
+
+function _bk_latest_key() {
+    local server="$1"
+    local name="$2"
+    aws --endpoint-url "$BK_S3_ENDPOINT" s3 ls "s3://${BK_S3_BUCKET}/servers/${server}/${name}/" --recursive 2>/dev/null | sort | tail -n 1 | awk '{print $4}'
+}
+
+function _bk_exact_key() {
+    local server="$1"
+    local name="$2"
+    local stamp="$3"
+    echo "servers/${server}/${name}/${server}-${name}-${stamp}.tar.gz"
+}
+
+function _bk_key_exists() {
+    local key="$1"
+    aws --endpoint-url "$BK_S3_ENDPOINT" s3 ls "s3://${BK_S3_BUCKET}/${key}" >/dev/null 2>&1
+}
+
+function _bk_clean_devuser_home() {
+    shopt -s dotglob nullglob
+    for item in /home/devuser/* /home/devuser/.[!.]* /home/devuser/..?*; do
+        [ -e "$item" ] || continue
+        rm -rf "$item"
+    done
+    shopt -u dotglob nullglob
+}
+
+function _bk_clean_root_home() {
+    shopt -s dotglob nullglob
+    for item in /root/* /root/.[!.]* /root/..?*; do
+        [ -e "$item" ] || continue
+        rm -rf "$item"
+    done
+    shopt -u dotglob nullglob
+}
+
+function _bk_capture_manifests() {
+    local manifest_dir="$1"
+    mkdir -p "$manifest_dir"
+
+    local _BUILTIN_FILTER="^(tzdata|openssh-server|sudo|curl|wget|git|nano|procps|net-tools|iputils-ping|dnsutils|lsof|htop|jq|speedtest-cli|unzip|tree|python3|python3-pip|python3-venv|ca-certificates|gnupg|nodejs|tailscale|tmux|screen|vim|zip|rsync|socat|telnet|ncdu|cloudflared)$"
+    apt-mark showmanual 2>/dev/null | sort | grep -vE "$_BUILTIN_FILTER" > "${manifest_dir}/apt-manual.txt" || true
+    sudo dpkg --get-selections 2>/dev/null > "${manifest_dir}/dpkg-selections.txt" || true
+    pip3 freeze 2>/dev/null | sort | grep -viE '^(awscli|botocore|s3transfer|jmespath|docutils|colorama|rsa|pyasn1|python-dateutil|urllib3|PyYAML|six)==' > "${manifest_dir}/pip-freeze.txt" || true
+    npm -g ls --depth=0 --parseable 2>/dev/null | tail -n +2 | xargs -r -n 1 basename | sort -u | grep -v '^codex$' > "${manifest_dir}/npm-global.txt" || true
+    tmux list-sessions -F "#{session_name}" 2>/dev/null | sort > "${manifest_dir}/tmux-sessions.txt" || true
+}
+
+function _bk_apply_manifests() {
+    local manifest_dir="$1"
+
+    [ -d "$manifest_dir" ] || return 0
+
+    if [ -s "${manifest_dir}/apt-manual.txt" ]; then
+        echo -e "\e[1;33m⌛ Reinstalling apt packages from manifest ...\e[0m"
+        sudo apt-get update
+        xargs -r sudo apt-get install -y --no-install-recommends < "${manifest_dir}/apt-manual.txt" || true
+        sudo apt-get clean || true
+        sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* 2>/dev/null || true
+    fi
+
+    if [ -s "${manifest_dir}/pip-freeze.txt" ]; then
+        echo -e "\e[1;33m⌛ Reinstalling pip packages from manifest ...\e[0m"
+        sudo python3 -m pip install -r "${manifest_dir}/pip-freeze.txt" || true
+    fi
+
+    if [ -s "${manifest_dir}/npm-global.txt" ]; then
+        echo -e "\e[1;33m⌛ Reinstalling global npm packages from manifest ...\e[0m"
+        while IFS= read -r pkg; do
+            [ -n "$pkg" ] || continue
+            sudo npm i -g "$pkg" --no-audit --no-fund || true
+        done < "${manifest_dir}/npm-global.txt"
+        sudo npm cache clean --force >/dev/null 2>&1 || true
+    fi
+}
+
+function _bk_extract_and_apply() {
+    local archive="$1"
+    local workdir="$2"
+    local manifest_dir=""
+
+    rm -rf "$workdir"
+    mkdir -p "$workdir"
+
+    tar -xzpf "$archive" -C "$workdir" || return 1
+
+    if [ -d "$workdir/home/devuser" ]; then
+        sudo mkdir -p /home
+        sudo cp -a "$workdir/home/devuser" /home/
+    fi
+
+    if [ -d "$workdir/root" ]; then
+        sudo cp -a "$workdir/root" /
+    fi
+
+    sudo rm -f "$workdir/etc/hostname" "$workdir/etc/hosts" "$workdir/etc/resolv.conf" "$workdir/etc/machine-id" 2>/dev/null || true
+
+    if [ -d "$workdir/etc" ]; then
+        sudo mkdir -p /etc
+        sudo cp -a "$workdir/etc/." /etc/
+    fi
+
+    if [ -d "$workdir/usr/local" ]; then
+        sudo mkdir -p /usr/local
+        sudo cp -a "$workdir/usr/local/." /usr/local/
+    fi
+
+    if [ -d "$workdir/opt" ]; then
+        sudo mkdir -p /opt
+        sudo cp -a "$workdir/opt/." /opt/
+    fi
+
+    manifest_dir=$(find "$workdir" -maxdepth 1 -type d -name 'phoenix-bk-manifests-*' | head -n 1)
+    _bk_apply_manifests "$manifest_dir"
+
+    sudo chown -R devuser:devuser /home/devuser 2>/dev/null || true
+    return 0
+}
+
+function _bk_clean_practical_state() {
+    echo -e "\e[1;33m⌛ Clearing writable restore areas ...\e[0m"
+    _bk_clean_devuser_home || return 1
+    sudo bash -lc "$(declare -f _bk_clean_root_home); _bk_clean_root_home" || true
+    sudo rm -rf /usr/local/* /opt/* 2>/dev/null || true
+    return 0
+}
+
+function bk() {
+    local action="$1"
+    local server="$2"
+    local name="$3"
+    local stamp="$4"
+    local tmp_dir="/tmp/bkwork"
+    local inspect_base="/tmp/bk-inspect"
+    local archive=""
+    local key=""
+    local latest_key=""
+    local now_stamp=""
+    local target_dir=""
+    local manifest_dir=""
+    local workdir=""
+
+    _bk_require_env || return 1
+    mkdir -p "$tmp_dir" "$inspect_base"
+
+    case "$action" in
+        save)
+            if [ -z "$server" ] || [ -z "$name" ]; then
+                echo -e "\e[1;31m✘ Usage: bk save <server> <n>\e[0m"
+                return 1
+            fi
+
+            now_stamp=$(date +"%Y%m%d-%H%M%S")
+            archive="${tmp_dir}/${server}-${name}-${now_stamp}.tar.gz"
+            key="servers/${server}/${name}/${server}-${name}-${now_stamp}.tar.gz"
+            manifest_dir="${tmp_dir}/phoenix-bk-manifests-${server}-${name}-${now_stamp}"
+
+            echo -e "\e[1;33m⌛ Capturing practical full system backup ...\e[0m"
+            _bk_capture_manifests "$manifest_dir"
+
+            tar -czpf "$archive" --ignore-failed-read \
+                --exclude='etc/hostname' \
+                --exclude='etc/hosts' \
+                --exclude='etc/resolv.conf' \
+                --exclude='etc/machine-id' \
+                -C / home/devuser root etc usr/local opt \
+                -C "$tmp_dir" "$(basename "$manifest_dir")"
+
+            echo -e "\e[1;33m⌛ Uploading to R2 ...\e[0m"
+            aws --endpoint-url "$BK_S3_ENDPOINT" s3 cp "$archive" "s3://${BK_S3_BUCKET}/${key}" --only-show-errors || {
+                rm -f "$archive"
+                rm -rf "$manifest_dir"
+                echo -e "\e[1;31m✘ Upload failed.\e[0m"
+                return 1
+            }
+
+            rm -f "$archive"
+            rm -rf "$manifest_dir"
+            echo -e "\e[1;32m✔ Backup saved successfully.\e[0m"
+            echo -e "\e[1;36mKey:\e[0m ${key}"
+            ;;
+        list)
+            if [ -z "$server" ]; then
+                echo -e "\e[1;31m✘ Usage: bk list <server>\e[0m"
+                return 1
+            fi
+
+            echo -e "\n\e[1;36m📦 Backups for server: ${server}\e[0m"
+            echo -e "\e[90m────────────────────────────────────────────────────────────────────\e[0m"
+            aws --endpoint-url "$BK_S3_ENDPOINT" s3 ls "s3://${BK_S3_BUCKET}/servers/${server}/" --recursive
+            echo -e "\e[90m────────────────────────────────────────────────────────────────────\e[0m\n"
+            ;;
+        inspect)
+            if [ -z "$server" ] || [ -z "$name" ]; then
+                echo -e "\e[1;31m✘ Usage: bk inspect <server> <n>\e[0m"
+                return 1
+            fi
+
+            latest_key=$(_bk_latest_key "$server" "$name")
+            if [ -z "$latest_key" ]; then
+                echo -e "\e[1;31m✘ No backup found for server='${server}' name='${name}'.\e[0m"
+                return 1
+            fi
+
+            archive="${tmp_dir}/inspect-${server}-${name}.tar.gz"
+            now_stamp=$(basename "$latest_key" .tar.gz)
+            target_dir="${inspect_base}/${server}/${name}/${now_stamp}"
+
+            rm -rf "$target_dir"
+            mkdir -p "$target_dir"
+
+            echo -e "\e[1;33m⌛ Downloading latest backup for inspect ...\e[0m"
+            aws --endpoint-url "$BK_S3_ENDPOINT" s3 cp "s3://${BK_S3_BUCKET}/${latest_key}" "$archive" --only-show-errors || {
+                rm -f "$archive"
+                echo -e "\e[1;31m✘ Download failed.\e[0m"
+                return 1
+            }
+
+            echo -e "\e[1;33m⌛ Extracting to inspect path ...\e[0m"
+            tar -xzpf "$archive" -C "$target_dir" || {
+                rm -f "$archive"
+                echo -e "\e[1;31m✘ Extract failed.\e[0m"
+                return 1
+            }
+
+            rm -f "$archive"
+            echo -e "\e[1;32m✔ Inspect copy is ready.\e[0m"
+            echo -e "\e[1;36mPath:\e[0m ${target_dir}"
+            echo -e "\e[1;33mTip:\e[0m Run: tree -a \"${target_dir}\" | head -n 150"
+            ;;
+        restore)
+            if [ -z "$server" ] || [ -z "$name" ]; then
+                echo -e "\e[1;31m✘ Usage: bk restore <server> <n>\e[0m"
+                return 1
+            fi
+
+            latest_key=$(_bk_latest_key "$server" "$name")
+            if [ -z "$latest_key" ]; then
+                echo -e "\e[1;31m✘ No backup found for server='${server}' name='${name}'.\e[0m"
+                return 1
+            fi
+
+            archive="${tmp_dir}/restore-${server}-${name}.tar.gz"
+            workdir="${tmp_dir}/restore-tree-${server}-${name}"
+
+            echo -e "\e[1;33m⌛ Downloading latest backup ...\e[0m"
+            aws --endpoint-url "$BK_S3_ENDPOINT" s3 cp "s3://${BK_S3_BUCKET}/${latest_key}" "$archive" --only-show-errors || {
+                rm -f "$archive"
+                echo -e "\e[1;31m✘ Download failed.\e[0m"
+                return 1
+            }
+
+            echo -e "\e[1;33m⌛ Restoring practical full system backup ...\e[0m"
+            _bk_extract_and_apply "$archive" "$workdir" || {
+                rm -f "$archive"
+                rm -rf "$workdir"
+                echo -e "\e[1;31m✘ Restore failed.\e[0m"
+                return 1
+            }
+
+            rm -f "$archive"
+            rm -rf "$workdir"
+            echo -e "\e[1;32m✔ Restore complete (merge mode).\e[0m"
+            echo -e "\e[1;33mBehavior:\e[0m writable dirs and configs merge হয়েছে, packages manifest থেকেও apply করা হয়েছে."
+            ;;
+        restore-at)
+            if [ -z "$server" ] || [ -z "$name" ] || [ -z "$stamp" ]; then
+                echo -e "\e[1;31m✘ Usage: bk restore-at <server> <n> <timestamp>\e[0m"
+                echo -e "\e[1;33mExample:\e[0m bk restore-at srv-a test1 20260420-154500"
+                return 1
+            fi
+
+            key=$(_bk_exact_key "$server" "$name" "$stamp")
+            if ! _bk_key_exists "$key"; then
+                echo -e "\e[1;31m✘ Exact backup not found.\e[0m"
+                echo -e "\e[1;36mExpected key:\e[0m ${key}"
+                return 1
+            fi
+
+            archive="${tmp_dir}/restore-at-${server}-${name}-${stamp}.tar.gz"
+            workdir="${tmp_dir}/restore-at-tree-${server}-${name}-${stamp}"
+
+            echo -e "\e[1;33m⌛ Downloading exact backup ...\e[0m"
+            aws --endpoint-url "$BK_S3_ENDPOINT" s3 cp "s3://${BK_S3_BUCKET}/${key}" "$archive" --only-show-errors || {
+                rm -f "$archive"
+                echo -e "\e[1;31m✘ Download failed.\e[0m"
+                return 1
+            }
+
+            echo -e "\e[1;33m⌛ Restoring exact practical full system backup ...\e[0m"
+            _bk_extract_and_apply "$archive" "$workdir" || {
+                rm -f "$archive"
+                rm -rf "$workdir"
+                echo -e "\e[1;31m✘ Restore failed.\e[0m"
+                return 1
+            }
+
+            rm -f "$archive"
+            rm -rf "$workdir"
+            echo -e "\e[1;32m✔ Exact restore complete (merge mode).\e[0m"
+            echo -e "\e[1;36mRestored:\e[0m ${key}"
+            ;;
+        clean-restore)
+            if [ -z "$server" ] || [ -z "$name" ]; then
+                echo -e "\e[1;31m✘ Usage: bk clean-restore <server> <n>\e[0m"
+                return 1
+            fi
+
+            latest_key=$(_bk_latest_key "$server" "$name")
+            if [ -z "$latest_key" ]; then
+                echo -e "\e[1;31m✘ No backup found for server='${server}' name='${name}'.\e[0m"
+                return 1
+            fi
+
+            archive="${tmp_dir}/clean-restore-${server}-${name}.tar.gz"
+            workdir="${tmp_dir}/clean-restore-tree-${server}-${name}"
+
+            echo -e "\e[1;33m⌛ Downloading latest backup ...\e[0m"
+            aws --endpoint-url "$BK_S3_ENDPOINT" s3 cp "s3://${BK_S3_BUCKET}/${latest_key}" "$archive" --only-show-errors || {
+                rm -f "$archive"
+                echo -e "\e[1;31m✘ Download failed.\e[0m"
+                return 1
+            }
+
+            _bk_clean_practical_state || {
+                rm -f "$archive"
+                echo -e "\e[1;31m✘ Could not clear writable restore areas.\e[0m"
+                return 1
+            }
+
+            echo -e "\e[1;33m⌛ Restoring clean practical full system backup ...\e[0m"
+            _bk_extract_and_apply "$archive" "$workdir" || {
+                rm -f "$archive"
+                rm -rf "$workdir"
+                echo -e "\e[1;31m✘ Restore failed.\e[0m"
+                return 1
+            }
+
+            rm -f "$archive"
+            rm -rf "$workdir"
+            echo -e "\e[1;32m✔ Clean restore complete.\e[0m"
+            echo -e "\e[1;33mBehavior:\e[0m /home/devuser, /root, /usr/local, /opt clear করে restore করা হয়েছে; /etc merge হয়েছে."
+            ;;
+        *)
+            echo -e "\n\e[1;36m📦 Backup Commands\e[0m"
+            echo -e "\e[90m────────────────────────────────────────────────────────────────────\e[0m"
+            echo -e "  bk save <server> <n>"
+            echo -e "  bk list <server>"
+            echo -e "  bk inspect <server> <n>"
+            echo -e "  bk restore <server> <n>"
+            echo -e "  bk restore-at <server> <n> <timestamp>"
+            echo -e "  bk clean-restore <server> <n>"
+            echo -e "\e[90m────────────────────────────────────────────────────────────────────\e[0m\n"
+            return 1
+            ;;
+    esac
 }
 
 # ==========================================
@@ -612,9 +1015,9 @@ _cpu_history_file() {
 _cpu_record_history() {
   local used="$1" limit="$2" pct="$3" file tmp
   file="$(_cpu_history_file)"
-  tmp="${file}.tmp"
+  tmp="${file}.tmp.$$"
   printf '%s|%s|%s|%s\n' "$(date +%s)" "$used" "$limit" "$pct" >> "$file"
-  tail -n 120 "$file" > "$tmp" 2>/dev/null && mv "$tmp" "$file"
+  tail -n 120 "$file" > "$tmp" 2>/dev/null && mv -f "$tmp" "$file"
 }
 
 _cpu_avg_history() {
@@ -905,16 +1308,14 @@ function cpuuse() {
   printf "  %-20s : %s\n" "Limit" "$limit_label"
   if [ "$pct" != "-" ]; then
     printf "  %-20s : %s%%\n" "Percent of Limit" "$pct"
-  else
-    printf "  %-20s : %s\n" "Percent of Limit" "shared / not fixed"
-  fi
-  if [ -n "$avg30" ]; then
-    printf "  %-20s : %s vCPU\n" "Local Avg (30s)" "$avg30"
   fi
   printf "  %-20s : %s\n" "Throttle Events" "$thr_n"
   printf "  %-20s : %s%%\n" "Throttle Time" "$thr_pct"
-  printf "  %-20s : %s%%\n" "CPU PSI some avg10" "$psi_some"
-  printf "  %-20s : %s%%\n" "CPU PSI full avg10" "$psi_full"
+  printf "  %-20s : %s%%\n" "PSI some avg10" "$psi_some"
+  printf "  %-20s : %s%%\n" "PSI full avg10" "$psi_full"
+  if [ -n "$avg30" ]; then
+    printf "  %-20s : %s vCPU\n" "Local Avg 30s" "$avg30"
+  fi
   echo -e "\e[90m────────────────────────────────────────────────────────────────────\e[0m"
   echo -e "\e[1;33mTip:\e[0m For a calmer number closer to dashboard trend, run \e[1;36mcpu 5\e[0m or \e[1;36mcpulive 2\e[0m.\n"
 }
@@ -1216,7 +1617,6 @@ function DISK() {
   echo -e "\n${C_W}💾 DISK USAGE (Full Container View)${C_R}"
   echo -e "${C_G}────────────────────────────────────────────────────────────────────${C_R}"
 
-  # Root filesystem totals
   local fs_total fs_used fs_free fs_pct
   fs_total=$(df -h / 2>/dev/null | awk 'NR==2 {print $2}')
   fs_used=$(df -h / 2>/dev/null | awk 'NR==2 {print $3}')
@@ -1229,7 +1629,6 @@ function DISK() {
 
   echo -e "${C_G}────────────────────────────────────────────────────────────────────${C_R}"
 
-  # Container actual usage (what WE have written)
   echo -e " ${C_Y}📂 Container Directory Usage:${C_R}"
   printf "  ${C_W}%-22s${C_R} : ${C_C}%s${C_R}\n" "Home ($HOME)" "$(du -sh "$HOME" 2>/dev/null | cut -f1)"
   printf "  ${C_W}%-22s${C_R} : ${C_C}%s${C_R}\n" "/tmp" "$(du -sh /tmp 2>/dev/null | cut -f1)"
@@ -1239,13 +1638,11 @@ function DISK() {
 
   echo -e "${C_G}────────────────────────────────────────────────────────────────────${C_R}"
 
-  # All mounted filesystems
   echo -e " ${C_Y}📊 All Mounted Filesystems:${C_R}"
   df -h --output=source,size,used,avail,pcent,target 2>/dev/null | awk 'NR==1 {printf "  %-20s %-7s %-7s %-7s %-6s %s\n", $1,$2,$3,$4,$5,$6} NR>1 && /^\// {printf "  %-20s %-7s %-7s %-7s %-6s %s\n", $1,$2,$3,$4,$5,$6}'
 
   echo -e "${C_G}────────────────────────────────────────────────────────────────────${C_R}"
 
-  # Inode usage
   local inode_used inode_total inode_pct
   inode_used=$(df -i / 2>/dev/null | awk 'NR==2 {print $3}')
   inode_total=$(df -i / 2>/dev/null | awk 'NR==2 {print $2}')
@@ -1352,7 +1749,6 @@ function NET() {
   echo -e "\n${C_W}🌐 NETWORK USAGE (Since Container Boot)${C_R}"
   echo -e "${C_G}────────────────────────────────────────────────────────────────────${C_R}"
 
-  # Per-interface RX/TX from /proc/net/dev
   echo -e " ${C_Y}📡 Interface Traffic:${C_R}"
   printf "  ${C_W}%-12s %-18s %-18s %-12s %-12s${C_R}\n" "Interface" "RX (Download)" "TX (Upload)" "RX Packets" "TX Packets"
   echo -e "  ${C_G}$(printf '%.0s─' {1..68})${C_R}"
@@ -1363,9 +1759,7 @@ function NET() {
     rx_pkts=$3; tx_pkts=$11
     if (rx_bytes+tx_bytes > 0) {
       split("B KB MB GB TB", u, " ")
-      # RX human
       rx=rx_bytes; ri=1; while(rx>=1024 && ri<5){rx/=1024; ri++}
-      # TX human
       tx=tx_bytes; ti=1; while(tx>=1024 && ti<5){tx/=1024; ti++}
       printf "  %-12s %-18s %-18s %-12s %-12s\n", iface, sprintf("%.1f %s",rx,u[ri]), sprintf("%.1f %s",tx,u[ti]), rx_pkts, tx_pkts
     }
@@ -1373,7 +1767,6 @@ function NET() {
 
   echo -e "${C_G}────────────────────────────────────────────────────────────────────${C_R}"
 
-  # Active connections summary
   local tcp_count udp_count listen_count
   tcp_count=$(ss -t 2>/dev/null | grep -c ESTAB || echo 0)
   udp_count=$(ss -u 2>/dev/null | grep -v "^Netid" | wc -l || echo 0)
@@ -1386,13 +1779,11 @@ function NET() {
 
   echo -e "${C_G}────────────────────────────────────────────────────────────────────${C_R}"
 
-  # DNS info
   echo -e " ${C_Y}🔍 DNS Resolvers:${C_R}"
   grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{printf "  %s\n", $2}' | head -n 3
 
   echo -e "${C_G}────────────────────────────────────────────────────────────────────${C_R}"
 
-  # IP addresses
   echo -e " ${C_Y}🏠 IP Addresses:${C_R}"
   ip -4 addr show 2>/dev/null | awk '/inet / {printf "  %-12s : %s\n", $NF, $2}' | head -n 5
 
@@ -1403,13 +1794,8 @@ function NET() {
 function netlive() {
   echo -e "\e[1;36mLive network monitor. Press Ctrl+C to stop.\e[0m"
   local prev_rx prev_tx cur_rx cur_tx iface
-  # Pick first non-loopback interface
   iface=$(ip -o link show 2>/dev/null | awk -F': ' '!/lo/{print $2; exit}')
   [ -z "$iface" ] && iface="eth0"
-
-  _get_bytes() {
-    awk -v iface="${iface}:" '$1==iface {print $2, $10}' /proc/net/dev 2>/dev/null
-  }
 
   prev_rx=$(awk -v iface="${iface}:" '$1==iface {print $2}' /proc/net/dev 2>/dev/null)
   prev_tx=$(awk -v iface="${iface}:" '$1==iface {print $10}' /proc/net/dev 2>/dev/null)
@@ -1576,12 +1962,15 @@ if [ -n "$SSH_CLIENT" ] || [ -n "$SSH_TTY" ]; then
     printf "   \e[1;32m%-10s\e[0m : %s\n" "DISK" "Full disk usage"
     printf "   \e[1;32m%-10s\e[0m : %s\n" "NET" "Network traffic info"
     printf "   \e[1;32m%-10s\e[0m : %s\n" "dcodex" "Show Codex status"
+    printf "   \e[1;32m%-10s\e[0m : %s\n" "bk" "Backup/Restore helper"
     printf "   \e[1;36m%-10s\e[0m : \e[1;36m%s\e[0m\n\n" "cmds" "View ALL Shortcuts ⚡"
 fi
 EOF
 
 RUN cat /tmp/setup.sh >> /home/devuser/.bashrc && \
     cat /tmp/setup.sh >> /root/.bashrc && \
+    printf '\nif [ -f /etc/profile.d/railway_env.sh ]; then\n    source /etc/profile.d/railway_env.sh\nfi\n' >> /home/devuser/.bashrc && \
+    printf '\nif [ -f /etc/profile.d/railway_env.sh ]; then\n    source /etc/profile.d/railway_env.sh\nfi\n' >> /root/.bashrc && \
     chown devuser:devuser /home/devuser/.bashrc && \
     rm /tmp/setup.sh
 
@@ -1591,6 +1980,18 @@ RUN cat /tmp/setup.sh >> /home/devuser/.bashrc && \
 RUN cat > /start.sh <<'SH'
 #!/bin/bash
 set -e
+
+cat > /etc/profile.d/railway_env.sh <<EOF
+export BK_S3_ENDPOINT="${BK_S3_ENDPOINT}"
+export BK_S3_BUCKET="${BK_S3_BUCKET}"
+export BK_AWS_ACCESS_KEY_ID="${BK_AWS_ACCESS_KEY_ID}"
+export BK_AWS_SECRET_ACCESS_KEY="${BK_AWS_SECRET_ACCESS_KEY}"
+export BK_AWS_REGION="${BK_AWS_REGION:-auto}"
+EOF
+
+chmod 644 /etc/profile.d/railway_env.sh
+chown root:root /etc/profile.d/railway_env.sh
+
 /usr/sbin/sshd
 tail -f /dev/null
 SH
